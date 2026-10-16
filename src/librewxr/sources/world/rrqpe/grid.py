@@ -591,6 +591,9 @@ class RRQPEGrid:
                     dvar = ds.variables["DQF"]
                     scale = float(getattr(rvar, "scale_factor", 1.0))
                     offset = float(getattr(rvar, "add_offset", 0.0))
+                    fill = getattr(rvar, "_FillValue", None)
+                    # Read packed ints; scale_factor is applied once below.
+                    rvar.set_auto_maskandscale(False)
                 # A leading singleton time dimension is indexed away.
                 rate_shape, dqf_shape = rvar.shape[-2:], dvar.shape[-2:]
                 if rate_shape != (rows, cols) or dqf_shape != (rows, cols):
@@ -615,7 +618,10 @@ class RRQPEGrid:
                         dqf = np.asarray(dvar[(0,) + index if dvar.ndim == 3 else index])
                     rate = (rate_raw * scale + offset).astype(np.float32)
                     # DQF==3 is no-data; DQF==2 (degraded) stays valid.
-                    rate = np.where(dqf == 3, np.nan, rate)
+                    nodata = dqf == 3
+                    if fill is not None:
+                        nodata |= rate_raw == fill
+                    rate = np.where(nodata, np.nan, rate)
                     downsampled = block_nanmean_downsample(rate, factor)
                     encoded[start // factor:end // factor] = precip_rate_to_dbz_encoded(
                         downsampled, dbz_offset=dbz_offset,

@@ -475,7 +475,10 @@ def _synthetic_nc_bytes(rows: int = 4, cols: int = 4, rate: float = 3.0) -> byte
         rvar.add_offset = np.float32(0.0)
         rvar.units = "mm/h"
         dvar = ds.createVariable("DQF", "i1", ("Rows", "Columns"))
-        rvar[:] = np.full((rows, cols), int(rate / 0.1), dtype=np.int16)
+        # Store packed ints as the live files do; with auto-scaling on,
+        # netCDF4 would pack them again and the file would hold 10x the rate.
+        rvar.set_auto_maskandscale(False)
+        rvar[:] = np.full((rows, cols), round(rate / 0.1), dtype=np.int16)
         dvar[:] = np.zeros((rows, cols), dtype=np.int8)
         ds.close()
         with open(path, "rb") as fh:
@@ -554,6 +557,68 @@ class TestDecodeStrips:
         ds.close()
         grid = RRQPEGrid(cache_dir=tmp_path / "store", downsample=1)
         assert grid._decode_to_encoded(path.read_bytes(), 6.0) is None
+
+
+def _packed_nc_bytes(packed: np.ndarray, dqf: np.ndarray) -> bytes:
+    """NetCDF4 buffer holding raw packed RRQPE ints and DQF flags."""
+    from netCDF4 import Dataset
+
+    rows, cols = packed.shape
+    fd, path = tempfile.mkstemp(suffix=".nc")
+    os.close(fd)
+    try:
+        ds = Dataset(path, "w", format="NETCDF4")
+        ds.createDimension("Rows", rows)
+        ds.createDimension("Columns", cols)
+        rvar = ds.createVariable(
+            "RRQPE", "i2", ("Rows", "Columns"), fill_value=np.int16(-9990),
+        )
+        rvar.scale_factor = np.float32(0.1)
+        rvar.add_offset = np.float32(0.0)
+        rvar.set_auto_maskandscale(False)
+        rvar[:] = packed
+        ds.createVariable("DQF", "i1", ("Rows", "Columns"))[:] = dqf
+        ds.close()
+        with open(path, "rb") as fh:
+            return fh.read()
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+class TestDecodeScaling:
+    """Live files store RRQPE as int16 with scale_factor 0.1 and netCDF4
+    unpacks on read, so the decoder must apply the scale exactly once."""
+
+    # Columns: 1 mm/h, 10 mm/h (DQF 2, degraded but valid), fill value,
+    # 10 mm/h with DQF 3.
+    ROWS = 130
+    PACKED = np.tile(np.array([10, 100, -9990, 100], dtype=np.int16), (ROWS, 1))
+    DQF = np.tile(np.array([0, 2, 0, 3], dtype=np.int8), (ROWS, 1))
+
+    def test_packed_values_scaled_once(self, tmp_path):
+        grid = RRQPEGrid(cache_dir=tmp_path, downsample=1)
+        encoded = grid._decode_to_encoded(
+            _packed_nc_bytes(self.PACKED, self.DQF), 6.0,
+        )
+        expected = precip_rate_to_dbz_encoded(
+            np.array([1.0, 10.0, np.nan, np.nan], dtype=np.float32),
+            dbz_offset=6.0,
+        )
+        assert np.array_equal(encoded, np.tile(expected, (self.ROWS, 1)))
+
+    def test_fill_values_excluded_from_downsample_mean(self, tmp_path):
+        grid = RRQPEGrid(cache_dir=tmp_path, downsample=2)
+        encoded = grid._decode_to_encoded(
+            _packed_nc_bytes(self.PACKED, self.DQF), 6.0,
+        )
+        # Left blocks average 1 and 10 mm/h; right blocks are all no-data.
+        expected = precip_rate_to_dbz_encoded(
+            np.array([5.5, np.nan], dtype=np.float32), dbz_offset=6.0,
+        )
+        assert np.array_equal(encoded, np.tile(expected, (self.ROWS // 2, 1)))
 
 
 class _S3Transport:
