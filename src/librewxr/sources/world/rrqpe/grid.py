@@ -581,29 +581,38 @@ class RRQPEGrid:
                     rows = ds.dimensions["Rows"].size
                     cols = ds.dimensions["Columns"].size
                     rvar = ds.variables["RRQPE"]
-                    rate_raw = np.asarray(rvar[:], dtype=np.float64)
+                    dvar = ds.variables["DQF"]
+                    # Decode packed values exactly once, and bound temporary
+                    # allocations to a row strip instead of the whole globe.
+                    rvar.set_auto_maskandscale(False)
+                    dvar.set_auto_maskandscale(False)
                     scale = float(getattr(rvar, "scale_factor", 1.0))
                     offset = float(getattr(rvar, "add_offset", 0.0))
-                    dqf = np.asarray(ds.variables["DQF"][:])
+                    fill = getattr(rvar, "_FillValue", -9990)
+                    if rvar.shape[-2:] != (rows, cols) or dvar.shape[-2:] != (rows, cols):
+                        raise ValueError("RRQPE/DQF dimensions do not match Rows/Columns")
+                    factor = self._downsample
+                    out_rows, out_cols = rows // factor, cols // factor
+                    encoded = np.empty((out_rows, out_cols), dtype=np.uint8)
+                    step = max(factor, (64 // factor) * factor)
+                    for start in range(0, out_rows * factor, step):
+                        end = min(start + step, out_rows * factor)
+                        index = (slice(start, end), slice(0, out_cols * factor))
+                        rindex = (0,) + index if rvar.ndim == 3 else index
+                        dindex = (0,) + index if dvar.ndim == 3 else index
+                        raw = np.asarray(rvar[rindex])
+                        dqf = np.asarray(dvar[dindex])
+                        rate = raw.astype(np.float32)
+                        rate *= scale
+                        rate += offset
+                        rate[(dqf == 3) | (raw == fill)] = np.nan
+                        downsampled = rate if factor == 1 else block_nanmean_downsample(rate, factor)
+                        encoded[start // factor:end // factor] = precip_rate_to_dbz_encoded(
+                            downsampled, dbz_offset=dbz_offset,
+                        )
+                    return encoded
                 finally:
                     ds.close()
-            # Collapse a leading singleton time dimension if present.
-            if rate_raw.ndim == 3:
-                rate_raw = rate_raw[0]
-            if dqf.ndim == 3:
-                dqf = dqf[0]
-            if rate_raw.shape != (rows, cols) or dqf.shape != (rows, cols):
-                logger.warning(
-                    "RRQPE: unexpected shape rate=%s dqf=%s (want (%d, %d)); "
-                    "rejecting",
-                    rate_raw.shape, dqf.shape, rows, cols,
-                )
-                return None
-            rate = (rate_raw * scale + offset).astype(np.float32)
-            # DQF==3 is no-data; DQF==2 (degraded) stays valid.
-            rate = np.where(dqf == 3, np.nan, rate)
-            downsampled = block_nanmean_downsample(rate, self._downsample)
-            return precip_rate_to_dbz_encoded(downsampled, dbz_offset=dbz_offset)
         except Exception:
             logger.exception("RRQPE: failed to decode NetCDF4 buffer")
             return None
